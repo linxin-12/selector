@@ -4,7 +4,7 @@ Visual element picker for any web page. Select elements, add per-element instruc
 
 ## Install
 
-1. Visit the **[install page](https://linzhihuang.github.io/selector/)**
+1. Visit the **[install page](https://oil-oil.github.io/selector/)**
 2. Drag the **Selector** button to your bookmarks bar (one-time)
 3. Done
 
