@@ -58,15 +58,16 @@ document.addEventListener("DOMContentLoaded", function () {
     var css = results[0];
     var js  = results[1];
 
-    var code = "(function(){"
-      + "if(document.querySelector('.ai-editor-root'))return;"
+    // Inject CSS via <style> element, but run JS directly in the
+    // bookmarklet context — no <script> element needed.
+    // This bypasses CSP script-src restrictions (GitHub, etc.)
+    // because javascript: URLs run as user actions.
+    var cssInjector = "(function(){"
       + "var s=document.createElement('style');"
       + "s.textContent=" + JSON.stringify(css) + ";"
       + "document.head.appendChild(s);"
-      + "var sc=document.createElement('script');"
-      + "sc.textContent=" + JSON.stringify(js) + ";"
-      + "document.head.appendChild(sc);"
-      + "})()";
+      + "})();";
+    var code = cssInjector + js;
 
     link.href = "javascript:" + encodeURIComponent(code);
     link.classList.remove("loading");
