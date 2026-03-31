@@ -482,7 +482,6 @@
         <div class="${NS}-shortcuts">
           <span><kbd>Click</kbd> Select</span>
           <span><kbd>Shift</kbd> Multi-select</span>
-          <span><kbd>Drag</kbd> Marquee</span>
           <span><kbd>Space</kbd> Pause</span>
           <span><kbd>\u2318C</kbd> Copy</span>
           <span><kbd>Esc</kbd> Clear</span>
