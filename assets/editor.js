@@ -5,6 +5,9 @@
 (function () {
   "use strict";
 
+  // ── Top-level error boundary ───────────────────────────────
+  try {
+
   if (document.querySelector(".ai-editor-root")) return;
 
   const NS = "ai-editor";
@@ -25,14 +28,26 @@
   let wasJustDragging = false;
   let activePopover = null;
   const selectionHistory = [];
+  let copyTimer = null;
+  let isDarkPage = false;
 
   function on(target, type, fn, capture) {
     target.addEventListener(type, fn, capture);
     listeners.push({ target, type, fn, capture });
   }
 
+  // ── Detect page background brightness ─────────────────────
+  function detectDarkPage() {
+    const bg = getComputedStyle(document.body).backgroundColor;
+    const m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (!m) return false;
+    const lum = 0.299 * +m[1] + 0.587 * +m[2] + 0.114 * +m[3];
+    return lum < 128;
+  }
+
   // ── Init ───────────────────────────────────────────────────
   function init() {
+    isDarkPage = detectDarkPage();
     assignAiIds(document.body);
     createHoverBox();
     createChatPanel();
@@ -60,8 +75,10 @@
     for (const { target, type, fn, capture } of listeners) {
       target.removeEventListener(type, fn, capture);
     }
+    listeners.length = 0;
     destroyAllOverlays();
     removeAnnotationPopover();
+    if (copyTimer) { clearTimeout(copyTimer); copyTimer = null; }
     if (hoverBox) hoverBox.remove();
     if (chatPanel) chatPanel.remove();
   }
@@ -103,6 +120,18 @@
     return s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
   }
 
+  function isVisibleCached(el, rectCache) {
+    const cached = rectCache.get(el);
+    if (cached !== undefined) return cached;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 && r.height < 2) { rectCache.set(el, false); return false; }
+    const s = getComputedStyle(el);
+    const vis = s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+    if (vis) rectCache.set(el, r);
+    else rectCache.set(el, false);
+    return vis;
+  }
+
   function isMeaningful(el) {
     if (hasDirectText(el)) return true;
     if (el.querySelector("img,video,canvas,svg,button,a,input,select,textarea,iframe")) return true;
@@ -135,6 +164,11 @@
     hoverBox.style.width = (r.width + 2) + "px";
     hoverBox.style.height = (r.height + 2) + "px";
     hoverBox.style.opacity = "1";
+    if (isDarkPage) {
+      hoverBox.classList.add(`${NS}-hover-dark`);
+    } else {
+      hoverBox.classList.remove(`${NS}-hover-dark`);
+    }
   }
 
   // ── Mouse handling ─────────────────────────────────────────
@@ -200,12 +234,14 @@
     pushHistory();
     if (!e.shiftKey) clearSelection();
 
+    // Performance: cache rects to avoid calling getBoundingClientRect twice
+    const rectCache = new Map();
     document.querySelectorAll(`[${AI_ID}]`).forEach((el) => {
       if (isEditorElement(el)) return;
-      if (!isVisible(el)) return;
+      if (!isVisibleCached(el, rectCache)) return;
       if (!isMeaningful(el)) return;
-      const r = el.getBoundingClientRect();
-      if (rectsIntersect(mRect, r)) addSelection(el);
+      const r = rectCache.get(el);
+      if (r && rectsIntersect(mRect, r)) addSelection(el);
     });
 
     updateTags();
@@ -539,8 +575,25 @@
     popover.appendChild(actions);
 
     const r = btn.getBoundingClientRect();
-    popover.style.top = (r.bottom + 6) + "px";
-    popover.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+    const popH = 120; // approximate popover height
+    const popW = 240;
+    // Position below the button; flip above if near viewport bottom
+    if (r.bottom + 6 + popH > window.innerHeight) {
+      popover.style.top = Math.max(4, r.top - 6 - popH) + "px";
+    } else {
+      popover.style.top = (r.bottom + 6) + "px";
+    }
+    // Keep within horizontal viewport bounds
+    const rightSpace = window.innerWidth - r.right;
+    const leftSpace = r.left;
+    if (rightSpace >= popW) {
+      popover.style.left = r.left + "px";
+    } else if (leftSpace >= popW) {
+      popover.style.left = (r.right - popW) + "px";
+    } else {
+      popover.style.left = Math.max(4, Math.min(r.left, window.innerWidth - popW - 4)) + "px";
+    }
+    popover.style.right = "auto";
 
     document.body.appendChild(popover);
     activePopover = popover;
@@ -598,6 +651,9 @@
 
     chatPanel.querySelector('[data-action="minimize"]').onclick = toggleMinimize;
     chatPanel.querySelector('[data-action="close"]').onclick = destroy;
+
+    // Delegated click handler for tag-x buttons (bound once, no re-binding per update)
+    chatPanel.querySelector(`.${NS}-chat-tags`).addEventListener("click", handleTagClick, true);
 
     makeDraggable(chatPanel, chatPanel.querySelector(`.${NS}-drag-handle`));
   }
@@ -678,15 +734,6 @@
         container.appendChild(tag);
       }
 
-      container.querySelectorAll(`.${NS}-tag-x`).forEach((btn) => {
-        btn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const el = byAiId(btn.dataset.aiid);
-          if (el) removeSelection(el);
-          updateTags();
-        }, true);
-      });
-
       const clearAllBtn = document.createElement("button");
       clearAllBtn.className = `${NS}-tags-action`;
       clearAllBtn.title = "Clear all";
@@ -699,8 +746,17 @@
     }
   }
 
+  // Event delegation for tag-x buttons (bound once)
+  function handleTagClick(e) {
+    const xBtn = e.target.closest(`.${NS}-tag-x`);
+    if (!xBtn) return;
+    e.stopPropagation();
+    const el = byAiId(xBtn.dataset.aiid);
+    if (el) removeSelection(el);
+    updateTags();
+  }
+
   // ── Copy with button feedback ──────────────────────────────
-  let copyTimer = null;
   function showCopyFeedback(msg) {
     const btn = chatPanel.querySelector(`.${NS}-copy-btn`);
     if (copyTimer) clearTimeout(copyTimer);
@@ -828,7 +884,6 @@
       }
     }
     const reactInfo = getReactDebug(el);
-    const isReact = !!Object.keys(reactInfo).length;
     return {
       index,
       aiId: el.getAttribute(AI_ID),
@@ -869,4 +924,8 @@
   // ── Boot ───────────────────────────────────────────────────
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
+
+  } catch (err) {
+    console.error("[Selector] Failed to initialize:", err);
+  }
 })();
