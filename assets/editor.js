@@ -48,6 +48,7 @@
   // ── Init ───────────────────────────────────────────────────
   function init() {
     isDarkPage = detectDarkPage();
+    document.body.classList.add(`${NS}-active`);
     assignAiIds(document.body);
     createHoverBox();
     createChatPanel();
@@ -81,6 +82,7 @@
     if (copyTimer) { clearTimeout(copyTimer); copyTimer = null; }
     if (hoverBox) hoverBox.remove();
     if (chatPanel) chatPanel.remove();
+    document.body.classList.remove(`${NS}-active`);
   }
 
   // ── AI-ID ──────────────────────────────────────────────────
@@ -113,11 +115,32 @@
     return el;
   }
 
+  // Resolve target for click: use elementsFromPoint to find pointer-events:none elements
+  function resolveClickTarget(e) {
+    const allHits = document.elementsFromPoint(e.clientX, e.clientY);
+    for (const hit of allHits) {
+      if (isEditorElement(hit)) continue;
+      const r = hit.getBoundingClientRect();
+      if (r.width < 2 && r.height < 2) continue;
+      const s = getComputedStyle(hit);
+      if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") continue;
+      if (isMeaningful(hit)) return hit;
+    }
+    // Fallback to walking up from e.target
+    return resolveTarget(e.target);
+  }
+
   function isVisible(el) {
     const r = el.getBoundingClientRect();
     if (r.width < 2 && r.height < 2) return false;
     const s = getComputedStyle(el);
     return s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+  }
+
+  // Check if an element is visually present but not interactable (pointer-events:none, disabled, etc.)
+  function isNotInteractable(el) {
+    const s = getComputedStyle(el);
+    return s.pointerEvents === "none" || el.disabled === true;
   }
 
   function isVisibleCached(el, rectCache) {
@@ -134,6 +157,26 @@
 
   function isMeaningful(el) {
     if (hasDirectText(el)) return true;
+    // Interactive or semantic elements are always meaningful
+    const tag = el.tagName.toLowerCase();
+    const interactiveTags = new Set([
+      "button", "a", "input", "select", "textarea", "option", "optgroup",
+      "details", "summary", "dialog", "menu", "menuitem",
+      "label", "fieldset", "legend",
+      "img", "video", "canvas", "svg", "iframe", "embed", "object",
+      "table", "thead", "tbody", "tfoot", "tr", "th", "td",
+      "form", "progress", "meter", "output",
+    ]);
+    if (interactiveTags.has(tag)) return true;
+    // Elements with explicit roles are meaningful
+    const role = el.getAttribute("role");
+    if (role) return true;
+    // Elements with tabindex (including non-interactive ones) are meaningful
+    if (el.hasAttribute("tabindex")) return true;
+    // Contenteditable elements
+    if (el.isContentEditable) return true;
+    // Disabled elements are still meaningful for selection
+    if (el.hasAttribute("disabled")) return true;
     if (el.querySelector("img,video,canvas,svg,button,a,input,select,textarea,iframe")) return true;
     if (el.children.length > 1) return true;
     return false;
@@ -198,11 +241,29 @@
       }
     }
 
-    lastMoveTarget = resolveTarget(e.target);
+    lastMoveTarget = resolveHoverTarget(e);
     if (!rafPending) {
       rafPending = true;
       requestAnimationFrame(() => { showHover(lastMoveTarget); rafPending = false; });
     }
+  }
+
+  function resolveHoverTarget(e) {
+    // Use elementsFromPoint to find ALL elements at the cursor position,
+    // including those with pointer-events:none which e.target skips.
+    const allHits = document.elementsFromPoint(e.clientX, e.clientY);
+    for (const hit of allHits) {
+      if (isEditorElement(hit)) continue;
+      // Skip invisible hits (they may be transparent overlays)
+      const r = hit.getBoundingClientRect();
+      if (r.width < 2 && r.height < 2) continue;
+      const s = getComputedStyle(hit);
+      if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") continue;
+      // Found a visible, non-editor element — this is the real target
+      return resolveTarget(hit);
+    }
+    // Fallback
+    return resolveTarget(e.target);
   }
 
   function handleMouseDown(e) {
@@ -269,7 +330,7 @@
     if (sel) sel.removeAllRanges();
 
     pushHistory();
-    const el = resolveTarget(e.target);
+    const el = resolveClickTarget(e);
     if (e.shiftKey) {
       toggleElement(el);
     } else {

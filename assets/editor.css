@@ -1,3 +1,23 @@
+/* ── Global cursor override when editor is active ────────── */
+/* Force crosshair cursor on ALL elements, overriding pointer-events:none not-allowed, etc. */
+body.ai-editor-active,
+body.ai-editor-active * {
+  cursor: crosshair !important;
+}
+body.ai-editor-active .ai-editor-root,
+body.ai-editor-active .ai-editor-root * {
+  cursor: default !important;
+}
+body.ai-editor-active .ai-editor-root button,
+body.ai-editor-active .ai-editor-root [role="button"],
+body.ai-editor-active .ai-editor-root a {
+  cursor: pointer !important;
+}
+body.ai-editor-active .ai-editor-chat textarea,
+body.ai-editor-active .ai-editor-chat input {
+  cursor: text !important;
+}
+
 /* ── Reset ───────────────────────────────────────────────── */
 .ai-editor-root,
 .ai-editor-root * {

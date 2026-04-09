@@ -48,6 +48,7 @@
   // ── Init ───────────────────────────────────────────────────
   function init() {
     isDarkPage = detectDarkPage();
+    document.body.classList.add(`${NS}-active`);
     assignAiIds(document.body);
     createHoverBox();
     createChatPanel();
@@ -84,6 +85,7 @@
     if (copyTimer) { clearTimeout(copyTimer); copyTimer = null; }
     if (hoverBox) hoverBox.remove();
     if (chatPanel) chatPanel.remove();
+    document.body.classList.remove(`${NS}-active`);
     delete window.__selectorDestroy;
   }
 
@@ -117,6 +119,27 @@
     return el;
   }
 
+  // Check if an element is visually present but not interactable (pointer-events:none, disabled, etc.)
+  function isNotInteractable(el) {
+    const s = getComputedStyle(el);
+    return s.pointerEvents === "none" || el.disabled === true;
+  }
+
+  // Resolve target for click: use elementsFromPoint to find pointer-events:none elements
+  function resolveClickTarget(e) {
+    const allHits = document.elementsFromPoint(e.clientX, e.clientY);
+    for (const hit of allHits) {
+      if (isEditorElement(hit)) continue;
+      const r = hit.getBoundingClientRect();
+      if (r.width < 2 && r.height < 2) continue;
+      const s = getComputedStyle(hit);
+      if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") continue;
+      if (isMeaningful(hit)) return hit;
+    }
+    // Fallback to walking up from e.target
+    return resolveTarget(e.target);
+  }
+
   function isVisible(el) {
     const r = el.getBoundingClientRect();
     if (r.width < 2 && r.height < 2) return false;
@@ -138,6 +161,21 @@
 
   function isMeaningful(el) {
     if (hasDirectText(el)) return true;
+    const tag = el.tagName.toLowerCase();
+    const interactiveTags = new Set([
+      "button", "a", "input", "select", "textarea", "option", "optgroup",
+      "details", "summary", "dialog", "menu", "menuitem",
+      "label", "fieldset", "legend",
+      "img", "video", "canvas", "svg", "iframe", "embed", "object",
+      "table", "thead", "tbody", "tfoot", "tr", "th", "td",
+      "form", "progress", "meter", "output",
+    ]);
+    if (interactiveTags.has(tag)) return true;
+    const role = el.getAttribute("role");
+    if (role) return true;
+    if (el.hasAttribute("tabindex")) return true;
+    if (el.isContentEditable) return true;
+    if (el.hasAttribute("disabled")) return true;
     if (el.querySelector("img,video,canvas,svg,button,a,input,select,textarea,iframe")) return true;
     if (el.children.length > 1) return true;
     return false;
@@ -202,11 +240,24 @@
       }
     }
 
-    lastMoveTarget = resolveTarget(e.target);
+    lastMoveTarget = resolveHoverTarget(e);
     if (!rafPending) {
       rafPending = true;
       requestAnimationFrame(() => { showHover(lastMoveTarget); rafPending = false; });
     }
+  }
+
+  function resolveHoverTarget(e) {
+    const allHits = document.elementsFromPoint(e.clientX, e.clientY);
+    for (const hit of allHits) {
+      if (isEditorElement(hit)) continue;
+      const r = hit.getBoundingClientRect();
+      if (r.width < 2 && r.height < 2) continue;
+      const s = getComputedStyle(hit);
+      if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") continue;
+      return resolveTarget(hit);
+    }
+    return resolveTarget(e.target);
   }
 
   function handleMouseDown(e) {
@@ -272,7 +323,7 @@
     if (sel) sel.removeAllRanges();
 
     pushHistory();
-    const el = resolveTarget(e.target);
+    const el = resolveClickTarget(e);
     if (e.shiftKey) {
       toggleElement(el);
     } else {
