@@ -96,6 +96,17 @@
     while ((node = walker.nextNode())) {
       if (isEditorElement(node)) continue;
       if (!node.hasAttribute(AI_ID)) node.setAttribute(AI_ID, `el-${aiIdCounter++}`);
+      // Recurse into same-origin iframes
+      if (node.tagName && node.tagName.toLowerCase() === "iframe") {
+        try {
+          const iframeDoc = node.contentDocument;
+          if (iframeDoc && iframeDoc.body) {
+            assignAiIds(iframeDoc.body);
+          }
+        } catch (_) {
+          // Cross-origin — skip
+        }
+      }
     }
   }
 
@@ -200,7 +211,7 @@
       hoverBox.style.opacity = "0";
       return;
     }
-    const r = el.getBoundingClientRect();
+    const r = getElementViewportRect(el);
     hoverBox.style.top = (r.top - 1) + "px";
     hoverBox.style.left = (r.left - 1) + "px";
     hoverBox.style.width = (r.width + 2) + "px";
@@ -374,7 +385,9 @@
     const aiId = el.getAttribute(AI_ID);
     const ov = selOverlays.get(aiId);
     if (!ov) return;
-    const r = el.getBoundingClientRect();
+
+    // Get the element's rect, converting iframe-relative coords to main-doc coords
+    const r = getElementViewportRect(el);
     const pad = 2;
 
     ov.box.style.top = (r.top - pad) + "px";
@@ -405,6 +418,45 @@
     } else {
       ov.annotateBtn.classList.remove(`${NS}-has-note`);
     }
+  }
+
+  // Get an element's bounding rect in the main (top) document's viewport coords
+  function getElementViewportRect(el) {
+    const r = el.getBoundingClientRect();
+    // If the element is not inside an iframe, just return its rect
+    const ownerDoc = el.ownerDocument;
+    if (ownerDoc === document) return r;
+
+    // Walk up through nested iframes, accumulating offsets
+    let rect = { top: r.top, left: r.left, width: r.width, height: r.height, right: r.right, bottom: r.bottom };
+    let currentDoc = ownerDoc;
+
+    while (currentDoc !== document) {
+      // Find the iframe element in the parent document that contains currentDoc
+      const parentWin = currentDoc.defaultView.parent;
+      const parentDoc = parentWin.document;
+      let iframeEl = null;
+      const iframes = parentDoc.querySelectorAll("iframe");
+      for (const iframe of iframes) {
+        try {
+          if (iframe.contentDocument === currentDoc) {
+            iframeEl = iframe;
+            break;
+          }
+        } catch (_) {}
+      }
+      if (!iframeEl) break;
+
+      const iframeRect = iframeEl.getBoundingClientRect();
+      rect.top += iframeRect.top;
+      rect.left += iframeRect.left;
+      rect.right = rect.left + rect.width;
+      rect.bottom = rect.top + rect.height;
+
+      currentDoc = parentDoc;
+    }
+
+    return rect;
   }
 
   function positionAllOverlays() {
@@ -451,6 +503,7 @@
     selectedElements = [];
     annotations.clear();
     removeAnnotationPopover();
+    navIframeStack = [];
   }
 
   // ── Selection history (undo) ────────────────────────────────
@@ -458,6 +511,7 @@
     selectionHistory.push({
       elements: [...selectedElements],
       annotations: new Map(annotations),
+      navIframeStack: navIframeStack.map(entry => ({ ...entry })),
     });
     if (selectionHistory.length > 30) selectionHistory.shift();
   }
@@ -470,15 +524,88 @@
     selectedElements = state.elements;
     annotations.clear();
     for (const [k, v] of state.annotations) annotations.set(k, v);
+    navIframeStack = state.navIframeStack || [];
     for (const el of selectedElements) createSelOverlay(el);
     updateTags();
+  }
+
+  // ── Iframe cross-document navigation helpers ──────────────
+  // Each "context" is either the main document or an iframe document.
+  // We track a navigation stack so ArrowDown can dive into iframes
+  // and ArrowUp can pop back out.
+
+  let navIframeStack = []; // [{iframeEl, prevDoc}]
+
+  function getIframeBody(iframeEl) {
+    try {
+      const doc = iframeEl.contentDocument;
+      if (!doc || !doc.body) return null;
+      return doc.body;
+    } catch (_) {
+      // Cross-origin iframe — cannot access
+      return null;
+    }
+  }
+
+  function currentDoc() {
+    if (navIframeStack.length > 0) {
+      const top = navIframeStack[navIframeStack.length - 1];
+      try {
+        const body = top.iframeEl.contentDocument.body;
+        if (body) return top.iframeEl.contentDocument;
+      } catch (_) {}
+    }
+    return document;
+  }
+
+  function currentBody() {
+    const doc = currentDoc();
+    return doc === document ? document.body : (doc.body || document.body);
   }
 
   // ── Parent / child navigation ─────────────────────────────
   function navigateToParent() {
     if (selectedElements.length !== 1) return;
-    let parent = selectedElements[0].parentElement;
-    while (parent && parent !== document.body && parent !== document.documentElement) {
+    const el = selectedElements[0];
+
+    // If we're inside an iframe and el is the iframe body or html,
+    // pop out of the iframe context and select the iframe element itself
+    if (navIframeStack.length > 0) {
+      const top = navIframeStack[navIframeStack.length - 1];
+      try {
+        const iframeDoc = top.iframeEl.contentDocument;
+        if (el === iframeDoc.body || el === iframeDoc.documentElement) {
+          navIframeStack.pop();
+          const iframeEl = top.iframeEl;
+          pushHistory();
+          clearSelection();
+          addSelection(iframeEl);
+          updateTags();
+          return;
+        }
+      } catch (_) {}
+    }
+
+    let parent = el.parentElement;
+    // Stop at the boundary of the current document context
+    const boundaryDoc = el.ownerDocument;
+    while (parent) {
+      // Don't go above the current document's html element
+      if (parent === boundaryDoc.documentElement) {
+        // If we're inside an iframe, this is the iframe's <html>;
+        // select the iframe's body instead and let the next ArrowUp pop out
+        if (navIframeStack.length > 0 && parent.tagName.toLowerCase() === "html") {
+          // Already at <html> of iframe — select the <body> first so next
+          // ArrowUp will pop out of the iframe
+          pushHistory();
+          clearSelection();
+          addSelection(boundaryDoc.body);
+          updateTags();
+          return;
+        }
+        break;
+      }
+      if (parent === document.body || parent === document.documentElement) break;
       if (!isEditorElement(parent) && isVisible(parent)) {
         pushHistory();
         clearSelection();
@@ -492,7 +619,33 @@
 
   function navigateToChild() {
     if (selectedElements.length !== 1) return;
-    for (const child of selectedElements[0].children) {
+    const el = selectedElements[0];
+
+    // If the selected element is an iframe, try to enter its document
+    if (el.tagName && el.tagName.toLowerCase() === "iframe") {
+      const iframeBody = getIframeBody(el);
+      if (iframeBody) {
+        navIframeStack.push({ iframeEl: el, prevDoc: currentDoc() });
+        // Find the first meaningful child inside the iframe
+        for (const child of iframeBody.children) {
+          if (!isEditorElement(child) && isVisible(child) && isMeaningful(child)) {
+            pushHistory();
+            clearSelection();
+            addSelection(child);
+            updateTags();
+            return;
+          }
+        }
+        // If no meaningful child, just select the body
+        pushHistory();
+        clearSelection();
+        addSelection(iframeBody);
+        updateTags();
+        return;
+      }
+    }
+
+    for (const child of el.children) {
       if (!isEditorElement(child) && isVisible(child) && isMeaningful(child)) {
         pushHistory();
         clearSelection();
