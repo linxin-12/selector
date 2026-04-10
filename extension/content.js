@@ -70,8 +70,212 @@
     on(window, "scroll", scheduleReposition, true);
     on(window, "resize", scheduleReposition, false);
 
+    // Inject listeners into same-origin iframes
+    injectIframeListeners();
+    // Observe dynamically added iframes
+    observeIframes();
+
     // Expose destroy for the background script to call
     window.__selectorDestroy = destroy;
+  }
+
+  // ── Iframe injection ───────────────────────────────────────
+  // Inject mousemove/click/mousedown listeners into same-origin
+  // iframes so the selector can intercept events inside them.
+
+  let iframeListeners = []; // [{iframe, fns}]
+
+  function injectIframeListeners() {
+    const iframes = document.querySelectorAll("iframe");
+    for (const iframe of iframes) {
+      injectIntoIframe(iframe);
+    }
+  }
+
+  function injectIntoIframe(iframeEl) {
+    // Don't inject twice
+    if (iframeListeners.some(il => il.iframe === iframeEl)) return;
+
+    let iframeDoc;
+    try {
+      iframeDoc = iframeEl.contentDocument;
+      if (!iframeDoc) return;
+    } catch (_) {
+      // Cross-origin
+      return;
+    }
+
+    // Ensure AI IDs are assigned in this iframe
+    if (iframeDoc.body) assignAiIds(iframeDoc.body);
+
+    const fns = [];
+
+    const onIframe = (type, fn) => {
+      iframeDoc.addEventListener(type, fn, true);
+      fns.push({ type, fn });
+    };
+
+    // Reposition overlays when iframe scrolls or resizes
+    onIframe("scroll", () => {
+      positionAllOverlays();
+    });
+
+    try {
+      const iframeWin = iframeEl.contentWindow;
+      if (iframeWin) {
+        const resizeFn = () => { positionAllOverlays(); };
+        iframeWin.addEventListener("resize", resizeFn);
+        fns.push({ type: "resize", fn: resizeFn, target: iframeWin });
+      }
+    } catch (_) {}
+
+    // mousemove inside iframe → resolve and show hover in main doc
+    onIframe("mousemove", (e) => {
+      if (minimized || paused) return;
+      const target = resolveIframeTarget(iframeEl, e);
+      if (target) {
+        lastMoveTarget = target;
+        if (!rafPending) {
+          rafPending = true;
+          requestAnimationFrame(() => { showHover(lastMoveTarget); rafPending = false; });
+        }
+      } else {
+        showHover(null);
+      }
+    });
+
+    // mouseleave iframe → hide hover overlay
+    onIframe("mouseleave", () => {
+      showHover(null);
+    });
+
+    // click inside iframe → select element
+    onIframe("click", (e) => {
+      if (minimized || paused) return;
+      e.preventDefault();
+      e.stopPropagation();
+      removeAnnotationPopover();
+      const sel = iframeDoc.defaultView.getSelection();
+      if (sel) sel.removeAllRanges();
+
+      const target = resolveIframeTarget(iframeEl, e);
+      if (!target) return;
+
+      // Update navIframeStack to reflect we are now in this iframe
+      updateNavStackForIframe(iframeEl);
+
+      pushHistory();
+      if (e.shiftKey) {
+        toggleElement(target);
+      } else {
+        clearSelection();
+        addSelection(target);
+      }
+      updateTags();
+    });
+
+    // mousedown inside iframe → prevent default and start drag tracking
+    onIframe("mousedown", (e) => {
+      if (minimized || paused) return;
+      if (e.button !== 0) return;
+      e.preventDefault();
+    });
+
+    iframeListeners.push({ iframe: iframeEl, doc: iframeDoc, fns });
+  }
+
+  function removeIframeListeners(iframeEl) {
+    const idx = iframeListeners.findIndex(il => il.iframe === iframeEl);
+    if (idx < 0) return;
+    const { doc, fns } = iframeListeners[idx];
+    for (const { type, fn, target } of fns) {
+      try {
+        const t = target || doc;
+        if (t === doc) t.removeEventListener(type, fn, true);
+        else t.removeEventListener(type, fn);
+      } catch (_) {}
+    }
+    iframeListeners.splice(idx, 1);
+  }
+
+  function removeAllIframeListeners() {
+    for (const { doc, fns } of iframeListeners) {
+      for (const { type, fn, target } of fns) {
+        try {
+          const t = target || doc;
+          if (t === doc) t.removeEventListener(type, fn, true);
+          else t.removeEventListener(type, fn);
+        } catch (_) {}
+      }
+    }
+    iframeListeners = [];
+  }
+
+  // Observe DOM for dynamically added iframes
+  let iframeObserver = null;
+  function observeIframes() {
+    iframeObserver = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node.tagName && node.tagName.toLowerCase() === "iframe") {
+            // Wait for iframe to load before injecting
+            const tryInject = () => injectIntoIframe(node);
+            if (node.contentDocument) tryInject();
+            else node.addEventListener("load", tryInject, { once: true });
+          }
+        }
+      }
+    });
+    iframeObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // Resolve an element inside an iframe from a mouse event
+  function resolveIframeTarget(iframeEl, e) {
+    const iframeDoc = iframeEl.contentDocument;
+    if (!iframeDoc) return null;
+
+    const allHits = iframeDoc.elementsFromPoint(e.clientX, e.clientY);
+    for (const hit of allHits) {
+      if (isEditorElement(hit)) continue;
+      const r = hit.getBoundingClientRect();
+      if (r.width < 2 && r.height < 2) continue;
+      const s = iframeDoc.defaultView.getComputedStyle(hit);
+      if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") continue;
+      // Use resolveTargetInDoc for iframe-local walk-up
+      return resolveTargetInDoc(hit, iframeDoc);
+    }
+    if (e.target) return resolveTargetInDoc(e.target, iframeDoc);
+    return null;
+  }
+
+  // Like resolveTarget, but respects the given document boundary
+  function resolveTargetInDoc(el, doc) {
+    const body = doc.body;
+    const html = doc.documentElement;
+    let cur = el;
+    while (cur && cur !== body && cur !== html) {
+      if (isEditorElement(cur)) { cur = cur.parentElement; continue; }
+      if (!isVisible(cur)) { cur = cur.parentElement; continue; }
+      if (isMeaningful(cur)) return cur;
+      cur = cur.parentElement;
+    }
+    return el;
+  }
+
+  // Update navIframeStack when user interacts inside an iframe
+  function updateNavStackForIframe(iframeEl) {
+    // If the iframe is already the top of the stack, nothing to do
+    if (navIframeStack.length > 0 && navIframeStack[navIframeStack.length - 1].iframeEl === iframeEl) {
+      return;
+    }
+    // If the iframe is somewhere in the stack, trim to that level
+    const existingIdx = navIframeStack.findIndex(entry => entry.iframeEl === iframeEl);
+    if (existingIdx >= 0) {
+      navIframeStack = navIframeStack.slice(0, existingIdx + 1);
+      return;
+    }
+    // Otherwise push this iframe onto the stack
+    navIframeStack.push({ iframeEl: iframeEl, prevDoc: currentDoc() });
   }
 
   // ── Destroy ────────────────────────────────────────────────
@@ -80,6 +284,8 @@
       target.removeEventListener(type, fn, capture);
     }
     listeners.length = 0;
+    removeAllIframeListeners();
+    if (iframeObserver) { iframeObserver.disconnect(); iframeObserver = null; }
     destroyAllOverlays();
     removeAnnotationPopover();
     if (copyTimer) { clearTimeout(copyTimer); copyTimer = null; }
@@ -115,7 +321,18 @@
   }
 
   function byAiId(id) {
-    return document.querySelector(`[${AI_ID}="${id}"]`);
+    // Search in main document first
+    let el = document.querySelector(`[${AI_ID}="${id}"]`);
+    if (el) return el;
+    // Search inside same-origin iframes
+    const iframes = document.querySelectorAll("iframe");
+    for (const iframe of iframes) {
+      try {
+        el = iframe.contentDocument.querySelector(`[${AI_ID}="${id}"]`);
+        if (el) return el;
+      } catch (_) {}
+    }
+    return null;
   }
 
   // ── Resolve target ─────────────────────────────────────────
@@ -301,12 +518,23 @@
     if (!e.shiftKey) clearSelection();
 
     const rectCache = new Map();
-    document.querySelectorAll(`[${AI_ID}]`).forEach((el) => {
+    // Collect elements from main document and iframes
+    const allElements = [...document.querySelectorAll(`[${AI_ID}]`)];
+    const iframes = document.querySelectorAll("iframe");
+    for (const iframe of iframes) {
+      try {
+        const iframeEls = iframe.contentDocument.querySelectorAll(`[${AI_ID}]`);
+        allElements.push(...iframeEls);
+      } catch (_) {}
+    }
+    allElements.forEach((el) => {
       if (isEditorElement(el)) return;
-      if (!isVisibleCached(el, rectCache)) return;
+      const r = getElementViewportRect(el);
+      if (r.width < 2 && r.height < 2) return;
+      const s = el.ownerDocument.defaultView.getComputedStyle(el);
+      if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") return;
       if (!isMeaningful(el)) return;
-      const r = rectCache.get(el);
-      if (r && rectsIntersect(mRect, r)) addSelection(el);
+      if (rectsIntersect(mRect, r)) addSelection(el);
     });
 
     updateTags();
@@ -1101,8 +1329,10 @@
   function buildSelector(el) {
     if (el.id) return `#${el.id}`;
     const parts = [];
+    const ownerBody = el.ownerDocument.body;
+    const ownerHtml = el.ownerDocument.documentElement;
     let node = el;
-    while (node && node !== document.body && node !== document.documentElement) {
+    while (node && node !== ownerBody && node !== ownerHtml) {
       let seg = node.tagName.toLowerCase();
       if (node.id) { parts.unshift(`#${node.id}`); break; }
       const p = node.parentElement;
@@ -1113,7 +1343,32 @@
       parts.unshift(seg);
       node = node.parentElement;
     }
+    // If element is inside an iframe, prefix with iframe selector
+    if (el.ownerDocument !== document) {
+      const iframeEl = findIframeByContentDoc(el.ownerDocument);
+      if (iframeEl) {
+        const iframeSel = buildSelector(iframeEl);
+        return iframeSel + " >> " + parts.join(" > ");
+      }
+    }
     return parts.join(" > ");
+  }
+
+  function findIframeByContentDoc(doc) {
+    // Search all iframes in main doc (and nested) for the one containing this doc
+    const search = (rootDoc) => {
+      const iframes = rootDoc.querySelectorAll("iframe");
+      for (const iframe of iframes) {
+        try {
+          if (iframe.contentDocument === doc) return iframe;
+          // Recurse into nested iframes
+          const nested = search(iframe.contentDocument);
+          if (nested) return nested;
+        } catch (_) {}
+      }
+      return null;
+    };
+    return search(document);
   }
 
   function truncate(s, max) {
